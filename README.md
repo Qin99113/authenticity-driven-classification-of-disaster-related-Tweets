@@ -6,12 +6,12 @@
   - Wendi Li  
   - Xiaoxuan Qin  
 * **Project presentation**: 
-  <a href="docs/presentation_slides.pdf" target="_blank" rel="noopener">
+  <a href="documents/presentation_slides.pdf" target="_blank" rel="noopener">
     🖥️ View Presentation Slides
   </a>
 
 * **Project paper**: 
-  <a href="docs/report_paper.pdf" target="_blank" rel="noopener">
+  <a href="documents/report_paper.pdf" target="_blank" rel="noopener">
     🖥️ View Report Paper
   </a>
 
