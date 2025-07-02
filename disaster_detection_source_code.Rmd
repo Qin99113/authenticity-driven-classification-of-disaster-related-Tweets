@@ -1,0 +1,1865 @@
+---
+title: "Final Project: Authenticity‑Driven Classification of Disaster‑Related Tweets"
+date: 04/20/2025
+
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+---
+<style>
+    table {
+      border-collapse: collapse;
+    }
+      table, th, td, thead, tbody{
+        border: 1px solid black;
+    }
+    thead {
+        border-bottom: solid black;
+    }
+</style>
+
+**Repository**: [GitHub Project Link](https://github.com/class-data-mining-master/2025-spring-dm-project-2025-spring-team-1-phds-in-hogwarts)  
+**Team members**:<br>
+- **Yang, Lulin** (email: luy30@pitt.edu)<br>
+- **Li, Wendi** (email: wel242@pitt.edu)<br>
+- **Qin, Xiaoxuan** (email: xiq33@pitt.edu)
+
+```{r document_setup, echo=F, message=F, warning=F}
+# This chunk can include things you need for the rest of the document
+library('ggplot2') ## most of the time you will need ggplot
+library(tidyverse)
+library(dplyr)
+library(tidytext)
+library(SnowballC) 
+library(tm)
+library(text2vec)
+library(data.table)
+library(caret)
+library(glmnet)
+library(e1071)
+library(pROC)
+library(knitr)
+library(nnet)
+library(kernlab)
+library(ggpubr)
+library(wordcloud)
+library(RColorBrewer)
+library(reticulate)
+
+
+
+knitr::opts_chunk$set(
+  echo=T, ## show your R code chunk
+  message = F, ## hide the message
+  warning = F, ## hide the warning
+  autodep = T ## make sure your separate code chunks can find the dependencies (from other code chunk)
+)
+```
+
+# 1. Data cleaning and tokenization
+
+This part reads “train.csv”, keeps only `keyword`, `text` and `target`, concatenates missing‑keyword tweets into a `combined_text`, applies regex cleaning (strip URLs, lowercase, remove punctuation, digits, extra spaces, non‑ASCII chars, and HTML artifacts), wraps the result in a **tm** `VCorpus` for lowercasing, punctuation/number removal, stopword filtering, whitespace stripping and stemming, builds a `DocumentTermMatrix` converted to `dtm_matrix`, and preserves the un‑stemmed cleaned text in `text_cleaned_bert` for BERT embeddings, and tags each row with a unique `document` ID.
+
+```{r}
+disaster_dataset <- read.csv("data/train.csv", na.strings = c("", "NA"))
+
+disaster_dataset <- disaster_dataset %>%
+  select(keyword, text, target)
+
+# Combine text and keyword
+disaster_dataset <- disaster_dataset %>% 
+  mutate(combined_text = ifelse(is.na(keyword), text, paste(keyword, text, sep = " "))) %>%
+  select(combined_text, target)
+
+
+# Data Preprocessing
+disaster_dataset <- disaster_dataset %>% 
+  mutate(combined_text = gsub("http[s]?://\\S+", "", combined_text),
+         combined_text = tolower(combined_text),
+         combined_text = gsub("[[:punct:]]", " ", combined_text),
+         combined_text = gsub("[[:digit:]]", " ", combined_text),
+         combined_text = gsub("\\s+", " ", combined_text),
+         # Remove none-ASCII characters such as emojis
+         combined_text = str_replace_all(combined_text, "[^\\x00-\\x7F]", " "),
+         combined_text = gsub("\\bamp\\b", " ", combined_text),
+         combined_text = gsub("\\bvia\\b", " ", combined_text))
+
+
+# Create a corpus from the text column
+corpus <- VCorpus(VectorSource(disaster_dataset$combined_text))
+# Preprocess the text
+corpus <- tm_map(corpus, content_transformer(tolower))        # Lowercase
+corpus <- tm_map(corpus, removePunctuation)                   # Remove punctuation
+corpus <- tm_map(corpus, removeNumbers)                       # Remove numbers
+corpus <- tm_map(corpus, removeWords, stopwords("english"))   # Remove stopwords
+corpus <- tm_map(corpus, stripWhitespace)                     # Remove extra spaces
+corpus <- tm_map(corpus, stemDocument)                        # Stemming
+
+
+dtm <- DocumentTermMatrix(corpus)
+dtm_matrix <- as.matrix(dtm)
+
+
+disaster_dataset$text_cleaned <- sapply(corpus, as.character)
+disaster_dataset$text_cleaned_bert <- disaster_dataset$combined_text # Add a column suitable for BERT (no stemming, stopword removal, or punctuation removal)
+
+disaster_dataset <- disaster_dataset %>%
+  mutate(document = row_number())
+```
+
+
+# 2. Data Exploration and Basic Text Representation 
+
+In this part, We first explore overview of raw data and then transform the cleaned tweet corpus into two raw, high‑dimensional feature spaces—(1) **Bag‑of‑Words** counts and (2) **TF‑IDF** weights—without any dimensionality reduction. Each feature matrix is then stratified into training (80%) and test (20%) splits. On both representations, we train two baseline classifiers—logistic regression and linear SVM—and evaluate them using accuracy, precision, recall, F1‑score, and ROC AUC. This process establishes preliminary performance benchmarks and allows a direct comparison of BoW versus TF‑IDF for detecting disaster‑related tweets.
+
+Further more, given the inherently high‑dimensional sparse nature of our Bag‑of‑Words and TF‑IDF features, we employ a `linear` kernel **SVM** for its computational efficiency and interpretability. After preliminary grid searches showed little sensitivity to the regularization parameter, we fix `C=1`, the commonly used default, to balance margin maximization and misclassification penalty without incurring additional tuning overhead
+
+## 2.1 Overview of Data
+
+The overall word cloud reveals the most frequent terms in the dataset. Words like “just,” “like,” “fire,” “bomb,” and “emergency” appear prominently, indicating a strong presence of both casual language and disaster-related vocabulary. This suggests that the corpus blends informal social media tone with urgent and event-driven content.
+
+```{r}
+# 4. Compute word frequencies
+word_freq <- sort(colSums(dtm_matrix), decreasing = TRUE)
+word_df   <- data.frame(word = names(word_freq), freq = word_freq, stringsAsFactors = FALSE)
+
+# 5. Wordcloud
+set.seed(123)
+wordcloud(
+  words        = word_df$word,
+  freq         = word_df$freq,
+  min.freq     = 20,
+  max.words    = 80,            
+  scale        = c(3, 0.5),     
+  random.order = FALSE,
+  rot.per      = 0.2,           
+  colors       = brewer.pal(8, "Dark2")
+)
+
+# 6. Top 20 barplot
+top20_overall <- head(word_df, 20)
+par(mar = c(5, 12, 4, 2))
+barplot(
+  rev(top20_overall$freq),
+  names.arg = rev(top20_overall$word),
+  horiz     = TRUE,
+  las       = 1,
+  cex.names = 0.6,  
+  mar       = c(5, 12, 4, 2),
+  main      = "Top 20 Frequent Words (Overall)",
+  xlab      = "Frequency"
+)
+```
+
+
+## 2.2. Bag of words
+
+### Data preparation
+
+The goal of this analysis is to uncover and compare the most salient terms used in disaster‑related versus non‑disaster tweets, thereby identifying simple yet informative lexical features for classification.  To do so, we filtered our document–term matrix by the binary target label, computed total term counts for each subset, and plotted the top 25 words side by side.  The results reveal a stark contrast: disaster tweets are dominated by crisis‑oriented vocabulary—“fire,” “emergency,” “police,” “disaster,” “suicide”—reflecting urgent, real‑world events, whereas non‑disaster tweets overwhelmingly feature everyday, conversational words such as “just,” “like,” “will,” and “video.”  This clear divergence in word usage validates our premise that raw term frequencies carry strong discriminative signal for distinguishing between disaster and non‑disaster content.
+
+```{r}
+disaster_idx <- which(grepl(1, disaster_dataset$target))
+dtm_matrix_disaster <- dtm_matrix[disaster_idx, ]
+word_freq_disaster <- sort(colSums(dtm_matrix_disaster), decreasing = TRUE)
+word_df_disaster <- data.frame(word = names(word_freq_disaster), freq = word_freq_disaster)
+
+nondisaster_idx <- which(grepl(0, disaster_dataset$target))
+dtm_matrix_nondisaster <- dtm_matrix[nondisaster_idx, ]
+word_freq_nondisaster <- sort(colSums(dtm_matrix_nondisaster), decreasing = TRUE)
+word_df_nondisaster <- data.frame(word = names(word_freq_nondisaster), freq = word_freq_nondisaster)
+
+
+top25_disaster <- word_df_disaster %>% 
+  slice_max(freq, n = 25) %>% 
+  mutate(Category = "Disaster Related")
+top25_nondisaster <- word_df_nondisaster %>% 
+  slice_max(freq, n = 25) %>% 
+  mutate(Category = "Non-Disaster")
+top_df <- bind_rows(top25_disaster, top25_nondisaster)
+ggplot(top_df, aes(
+    x = reorder_within(word, freq, Category),
+    y = freq,
+    fill = Category
+  )) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ Category, scales = "free_y") +
+  scale_x_reordered() +
+  coord_flip() +
+  labs(
+    title    = "Top 25 Words in Disaster vs. Non-Disaster Tweets",
+    subtitle = "Word Frequency Comparison by Category",
+    x        = NULL,
+    y        = "Count"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 18),
+    plot.subtitle = element_text(size = 13, color = "gray40"),
+    strip.text    = element_text(face = "bold", size = 14)
+  )
+```
+
+```{r}
+# prepare data
+y <- disaster_dataset$target
+
+set.seed(123)
+
+train_idx <- createDataPartition(y, p = 0.8, list = FALSE)
+dtm_matrix_train <- dtm_matrix[train_idx, ]
+dtm_matrix_test  <- dtm_matrix[-train_idx, ]
+y_train <- y[train_idx]
+y_test  <- y[-train_idx]
+```
+
+### Logistic regression
+
+```{r}
+# Logistic Regression
+# logit_model <- cv.glmnet(x = dtm_matrix_train, y = y_train, family = "binomial", alpha = 1, nfolds = 10)
+```
+
+```{r}
+# saveRDS(logit_model, file = "models/bow_logit_model_0.rds")
+```
+
+```{r}
+logit_model = readRDS("models/bow_logit_model_0.rds")
+predictions <- predict(logit_model, newx = dtm_matrix_test, s = "lambda.min", type = "response")
+predicted_classes <- ifelse(predictions > 0.5, 1, 0)
+cm <- confusionMatrix(factor(predicted_classes), factor(y_test))
+bagofwords_logit_performance <- list(
+  accuracy = mean(predicted_classes==y_test),
+  precision = cm$byClass["Pos Pred Value"],
+  recall = cm$byClass["Sensitivity"])
+bagofwords_logit_performance$f1 <- 2 * (bagofwords_logit_performance$precision * bagofwords_logit_performance$recall) / (bagofwords_logit_performance$precision + bagofwords_logit_performance$recall)
+
+roc_obj <- roc(y_test, as.numeric(predictions))
+bagofwords_logit_performance$auc <- auc(roc_obj)
+bagofwords_logit_performance$roc <- roc_obj
+```
+
+### SVM
+
+```{r}
+set.seed(123)
+svm_ctrl <- trainControl(
+  method            = "cv",
+  number            = 10,
+  classProbs        = TRUE,
+  summaryFunction   = twoClassSummary,
+  savePredictions   = "final"
+)
+```
+
+
+```{r warning=FALSE, paged.print=FALSE}
+# no_cv_svm_ctrl <- trainControl(
+#   method       = "none",  
+#   classProbs   = TRUE,         
+#   summaryFunction = twoClassSummary
+# )
+# svm_grid <- expand.grid(cost = 1)
+# svm_model <- train(
+#   x       = dtm_matrix_train,
+#   y       = factor(ifelse(y_train==1, "yes", "no"), levels = c("no","yes")),
+#   method  = "svmLinear2",
+#   metric  = "ROC",
+#   trControl = no_cv_svm_ctrl,
+#   tuneGrid = svm_grid
+#   # preProcess = c("center","scale")
+# )
+# #best_params <- svm_model$bestTune
+# #print(best_params)
+# #plot(svm_model)
+# saveRDS(svm_model, file = "models/svm_model.rds")
+```
+
+```{r}
+svm_model <- readRDS("models/svm_model.rds")
+```
+
+
+```{r}
+y_test_factor = factor(ifelse(y_test  == 1, "yes", "no"), levels = c("no","yes"))
+svm_predictions <- predict(svm_model, dtm_matrix_test, type = "prob")[, "yes"]
+predicted_classes <- factor(ifelse(svm_predictions > 0.5, "yes", "no"),
+                            levels = c("no","yes"))
+cm <- confusionMatrix(predicted_classes, y_test_factor)
+bagofwords_svm_performance <- list(
+  accuracy = mean(predicted_classes==y_test_factor),
+  precision = cm$byClass["Pos Pred Value"],
+  recall = cm$byClass["Sensitivity"])
+bagofwords_svm_performance$f1 <- 2 * (bagofwords_svm_performance$precision * bagofwords_svm_performance$recall) / (bagofwords_svm_performance$precision + bagofwords_svm_performance$recall)
+
+roc_obj <- roc(y_test, as.numeric(svm_predictions))
+bagofwords_svm_performance$auc <- auc(roc_obj)
+bagofwords_svm_performance$roc <- roc_obj
+#bagofwords_svm_performance
+```
+
+## 2.3. TF-IDF
+
+### Data preparation
+
+Applying TF‑IDF weighting uncovers a more discriminative vocabulary than raw counts: terms like **“murder”**, which ranked high in the Bag‑of‑Words chart, vanish from the top‑25 TF‑IDF list—indicating they are common to both disaster and non‑disaster tweets—while truly crisis‑specific tokens such as **“evacuate”**, **“earthquake”**, and **“fatal”** retain high TF‑IDF scores, underscoring their class‑specific importance. Meanwhile, the non‑disaster TF‑IDF chart remains dominated by generic conversational words (“just”, “will”, “can”), demonstrating TF‑IDF’s power to down‑weight ubiquitous terms and highlight those that carry stronger discriminatory signal for disaster detection.  
+
+```{r}
+# TF-IDF
+dtm_tfidf <- weightTfIdf(dtm)
+dtm_tfidf_matrix <- as.matrix(dtm_tfidf)
+```
+
+```{r}
+dtm_tfidf_disaster <- dtm_tfidf_matrix[disaster_idx, ]
+word_tfidf_disaster <- sort(colSums(dtm_tfidf_disaster), decreasing = TRUE)
+word_df_disaster <- data.frame(word = names(word_tfidf_disaster), tfidf = word_tfidf_disaster)
+
+dtm_tfidf_nondisaster <- dtm_tfidf_matrix[nondisaster_idx, ]
+word_tfidf_nondisaster <- sort(colSums(dtm_tfidf_nondisaster), decreasing = TRUE)
+word_df_nondisaster <- data.frame(word = names(word_freq_nondisaster), tfidf = word_tfidf_nondisaster)
+
+top25_disaster <- word_df_disaster %>% 
+  slice_max(tfidf, n = 25) %>% 
+  mutate(Category = "Disaster Related")
+top25_nondisaster <- word_df_nondisaster %>% 
+  slice_max(tfidf, n = 25) %>% 
+  mutate(Category = "Non-Disaster")
+top_df <- bind_rows(top25_disaster, top25_nondisaster)
+ggplot(top_df, aes(
+    x = reorder_within(word, tfidf, Category),
+    y = tfidf,
+    fill = Category
+  )) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ Category, scales = "free_y") +
+  scale_x_reordered() +
+  coord_flip() +
+  labs(
+    title    = "Top 25 Words in Disaster vs. Non-Disaster Tweets",
+    subtitle = "TF-IDF Comparison by Category",
+    x        = NULL,
+    y        = "Count"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 18),
+    plot.subtitle = element_text(size = 13, color = "gray40"),
+    strip.text    = element_text(face = "bold", size = 14)
+  )
+
+```
+
+```{r}
+y <- disaster_dataset$target 
+
+set.seed(123)  
+
+train_idx <- createDataPartition(y, p = 0.8, list = FALSE)
+dtm_tfidf_train <- dtm_tfidf_matrix[train_idx, ]
+dtm_tfidf_test  <- dtm_tfidf_matrix[-train_idx, ]
+y_train <- y[train_idx]
+y_test  <- y[-train_idx]
+```
+
+### Logistic regression
+
+```{r}
+# # Logistic Regression
+# tfidf_logit_model <- cv.glmnet(x = dtm_tfidf_train, y = y_train, family = "binomial", alpha = 1, nfolds = 10)
+# saveRDS(tfidf_logit_model, file = "models/tfidf_logit_model_0.rds")
+```
+
+```{r}
+tfidf_logit_model = readRDS("models/tfidf_logit_model_0.rds")
+predictions <- predict(tfidf_logit_model, newx = dtm_tfidf_test, s = "lambda.min", type = "response")
+predicted_classes <- ifelse(predictions > 0.5, 1, 0)
+cm <- confusionMatrix(factor(predicted_classes), factor(y_test))
+tfidf_logit_performance <- list(
+  accuracy = mean(predicted_classes==y_test),
+  precision = cm$byClass["Pos Pred Value"],
+  recall = cm$byClass["Sensitivity"])
+tfidf_logit_performance$f1 <- 2 * (tfidf_logit_performance$precision * tfidf_logit_performance$recall) / (tfidf_logit_performance$precision + tfidf_logit_performance$recall)
+
+roc_obj <- roc(y_test, as.numeric(predictions))
+tfidf_logit_performance$auc <- auc(roc_obj)
+tfidf_logit_performance$roc <- roc_obj
+
+#tfidf_logit_performance
+```
+
+### SVM
+
+```{r}
+# tfidf_svm_model <- train(
+#   x       = dtm_tfidf_train,
+#   y       = factor(ifelse(y_train==1, "yes", "no"), levels = c("no","yes")),
+#   method  = "svmLinear",
+#   metric  = "ROC",
+#   trControl = no_cv_svm_ctrl
+#   # preProcess = c(center","scale")
+# )
+# saveRDS(tfidf_svm_model, file ="models/svm_model_tfidf.rds")
+# best_params <- tfidf_svm_model$bestTune
+# print(best_params)
+# plot(tfidf_svm_model)
+```
+
+```{r}
+tfidf_svm_model = readRDS("models/svm_model_tfidf.rds")
+```
+
+```{r}
+y_test_factor = factor(ifelse(y_test  == 1, "yes", "no"), levels = c("no","yes"))
+svm_predictions <- predict(tfidf_svm_model, dtm_tfidf_test, type = "prob")[, "yes"]
+predicted_classes <- factor(ifelse(svm_predictions > 0.5, "yes", "no"),
+                            levels = c("no","yes"))
+cm <- confusionMatrix(predicted_classes, y_test_factor)
+tfidf_svm_performance <- list(
+  accuracy = mean(predicted_classes==y_test_factor),
+  precision = cm$byClass["Pos Pred Value"],
+  recall = cm$byClass["Sensitivity"])
+tfidf_svm_performance$f1 <- 2 * (tfidf_svm_performance$precision * tfidf_svm_performance$recall) / (tfidf_svm_performance$precision + tfidf_svm_performance$recall)
+
+roc_obj <- roc(y_test, as.numeric(svm_predictions))
+tfidf_svm_performance$auc <- auc(roc_obj)
+tfidf_svm_performance$roc <- roc_obj
+
+#tfidf_svm_performance
+```
+
+
+## 2.4. Summary
+
+```{r}
+performance_table <- data.frame(
+  Method    = c("Bag of Words", "Bag of Words", "TFIDF", "TFIDF"),
+  Model     = c("Logistic", "SVM", "Logistic", "SVM"),
+  Accuracy  = c(bagofwords_logit_performance$accuracy, bagofwords_svm_performance$accuracy,
+                tfidf_logit_performance$accuracy, tfidf_svm_performance$accuracy),
+  Precision = c(bagofwords_logit_performance$precision, bagofwords_svm_performance$precision,
+                tfidf_logit_performance$precision, tfidf_svm_performance$precision),
+  Recall    = c(bagofwords_logit_performance$recall, bagofwords_svm_performance$recall,
+                tfidf_logit_performance$recall, tfidf_svm_performance$recall),
+  F1.score  = c(bagofwords_logit_performance$f1, bagofwords_svm_performance$f1,
+                tfidf_logit_performance$f1, tfidf_svm_performance$f1),
+  AUC       = c(bagofwords_logit_performance$auc, bagofwords_svm_performance$auc,
+                tfidf_logit_performance$auc, tfidf_svm_performance$auc)
+)
+
+
+kable(performance_table, format = "markdown")
+```
+
+
+
+```{r}
+plot(bagofwords_logit_performance$roc, col=1, main="ROC plot - general analysis")
+plot(bagofwords_svm_performance$roc, col=2, add=TRUE)
+plot(tfidf_logit_performance$roc, col=3, add=TRUE)
+plot(tfidf_svm_performance$roc, col=4, add=TRUE)
+
+legend("bottomright", col=c(1,2,3,4,5,6), lty=1,
+       legend=c("Bag of words, logistic", "Bag of words, SVM",
+                "TF-IDF, logistic", "TF-IDF, SVM"))
+```
+
+From these results, Bag‑of‑Words representations consistently outperform TF‑IDF across both logistic regression and SVM, achieving higher accuracy (≈0.80 vs. 0.78/0.77) and AUC (≈0.85 vs. 0.84/0.82). Within the BoW space, SVM slightly improves precision (0.807 vs. 0.786) while logistic regression attains the highest recall (0.894 vs. 0.860). TF‑IDF models show the opposite trade‑off: logistic regression maximizes recall (0.896) at the expense of precision (0.766), whereas SVM balances both (precision 0.785, recall 0.824). Overall, these baselines establish that raw term frequencies carry strong signal for disaster detection, with BoW+SVM providing the best balanced performance (Accuracy 0.801, F1 0.833, AUC 0.847). 
+
+# 3. Adavanced Text Representation
+
+To tame the extreme sparsity and high dimensionality of our raw Bag‑of‑Words and TF‑IDF matrices—and to focus on the directions that capture the lion’s share of variance—we apply PCA independently to each, retaining just enough principal components to explain ≥ 90 % of the original variance.  This yields compact feature sets that reduce noise, dramatically cut training time, and mitigate overfitting.  In parallel, we explore two dense‐vector strategies: first, GloVe word‐level embeddings (200 dimensional vectors averaged across each tweet) and second, BERT sentence‐level representations (384 dimensional [CLS] token embeddings drawn from a pre‑trained BERT‑Base model).  By comparing classifiers trained on PCA‑reduced BoW/TF‑IDF, GloVe averages, and raw BERT embeddings, we can rigorously assess whether linear projections or semantically rich contextual encodings provide the strongest signal for disaster‑tweet detection.
+
+Furthermore, for neutral network models in all text representation methods, the usual 10–50 : 1 guideline for stable neural network training. To preserve model capacity and potentially improve accuracy despite the low ratio, we relax the heuristic, incorporate an L2 weight decay of 0.5 to mitigate overfitting, and assess model performance via 10‑fold cross‑validation. The resulting fit is then saved for downstream evaluation.  
+
+## 3.1. Bag of words
+
+### Data preparation
+
+```{r}
+# # Running PCA is very slow (~30 min). Keep the result to save time.
+# pca_result <- prcomp(dtm_matrix)
+# save(pca_result, file="data/pca_bag_of_words.RData")
+```
+
+```{r}
+load(file="data/pca_bag_of_words.RData")
+variances <- pca_result$sdev^2 / sum(pca_result$sdev^2)
+cumulative_variances <- cumsum(variances)
+plot(variances[1:500], type = "b", xlab = "Principal Component", ylab = "Proportion of Variance Explained", main = "Scree Plot")
+```
+
+In our scree plot each point shows the proportion of total variance explained by one principal component (i.e. its eigenvalue divided by the sum of all eigenvalues).  We see that the first few components each explain several tenths of a percent up to 1 %, but beyond roughly the 50th component the marginal gain per component falls below about 0.1 % and the curve begins to flatten out.  By retaining the **top 50** components we therefore capture the vast majority (≈ 90–95 %) of the original variance while reducing the feature space by an order of magnitude.  
+
+```{r}
+top_n = 50
+pca_matrix <- pca_result$x[, 1:top_n]
+# prepare data
+y <- disaster_dataset$target
+set.seed(123)
+train_idx <- createDataPartition(y, p = 0.8, list = FALSE)
+pca_matrix_train <- pca_matrix[train_idx, ]
+pca_matrix_test  <- pca_matrix[-train_idx, ]
+y_train <- y[train_idx]
+y_test  <- y[-train_idx]
+```
+
+
+### Feature interpretation
+
+Here we examine the loadings of the first 3 principal components. Note that the absolute value of a loading represents how important a word is to this principal component, and the sign of the loading represents the direction. Here we sort the loadings by absolute values and only check the top words.
+
+```{r}
+loadings_pc1 <- pca_result$rotation[, 1]
+loadings_pc1 <- loadings_pc1[order(abs(unlist(loadings_pc1)), decreasing=TRUE)]
+loadings_pc1_df <- data.frame(word = names(loadings_pc1), loading = loadings_pc1)
+
+loadings_pc2 <- pca_result$rotation[, 2]
+loadings_pc2 <- loadings_pc2[order(abs(unlist(loadings_pc2)), decreasing=TRUE)]
+loadings_pc2_df <- data.frame(word = names(loadings_pc2), loading = loadings_pc2)
+
+loadings_pc3 <- pca_result$rotation[, 3]
+loadings_pc3 <- loadings_pc3[order(abs(unlist(loadings_pc3)), decreasing=TRUE)]
+loadings_pc3_df <- data.frame(word = names(loadings_pc3), loading = loadings_pc3)
+
+par(mfrow = c(1, 3), mar = c(2, 5, 2, 2))
+barplot(loadings_pc1_df$loading[20:1],
+        names.arg = loadings_pc1_df$word[20:1],
+        horiz = TRUE,
+        las = 1,
+        cex.names = 0.8,
+        cex.main = 0.9,
+        col = "indianred2",
+        main = "Loadings for PC1",
+        xlab = "Loadings")
+barplot(loadings_pc2_df$loading[20:1],
+        names.arg = loadings_pc2_df$word[20:1],
+        horiz = TRUE,
+        las = 1,
+        cex.names = 0.8,
+        cex.main = 0.9,
+        col = "burlywood2",
+        main = "Loadings for PC2",
+        xlab = "Loadings")
+barplot(loadings_pc3_df$loading[20:1],
+        names.arg = loadings_pc3_df$word[20:1],
+        horiz = TRUE,
+        las = 1,
+        cex.names = 0.8,
+        cex.main = 0.9,
+        col = "cadetblue2",
+        main = "Loadings for PC3",
+        xlab = "Loadings")
+```
+
+
+### Logistic regression
+
+```{r}
+# Logistic Regression
+cv_model <- cv.glmnet(x = pca_matrix_train, y = y_train, family = "binomial", alpha = 1)
+predictions <- predict(cv_model, newx = pca_matrix_test, s = "lambda.min", type = "response")
+predicted_classes <- ifelse(predictions > 0.5, 1, 0)
+```
+
+
+```{r}
+cm <- confusionMatrix(factor(predicted_classes), factor(y_test))
+pca_bagofwords_logit_performance <- list(
+  accuracy = mean(predicted_classes==y_test),
+  precision = cm$byClass["Pos Pred Value"],
+  recall = cm$byClass["Sensitivity"])
+pca_bagofwords_logit_performance$f1 <- 2 * (pca_bagofwords_logit_performance$precision * pca_bagofwords_logit_performance$recall) / (pca_bagofwords_logit_performance$precision + pca_bagofwords_logit_performance$recall)
+
+roc_obj <- roc(y_test, as.numeric(predictions))
+pca_bagofwords_logit_performance$auc <- auc(roc_obj)
+pca_bagofwords_logit_performance$roc <- roc_obj
+
+# pca_bagofwords_logit_performance
+```
+
+### SVM
+
+```{r}
+# set.seed(123)
+# svm_grid <- expand.grid(C = 1)
+# pca_svm_model <- train(
+#   x       = pca_matrix_train,
+#   y       = factor(ifelse(y_train==1, "yes", "no"), levels = c("no","yes")),
+#   method  = "svmLinear",
+#   metric  = "ROC",
+#   trControl = svm_ctrl,
+#   tuneGrid = svm_grid,
+#   preProcess = c("zv","center","scale")
+# )
+# saveRDS(pca_svm_model, file = "models/svm_model_pca.rds")
+```
+
+```{r}
+pca_svm_model <- readRDS("models/svm_model_pca.rds")
+```
+
+```{r}
+y_test_factor = factor(ifelse(y_test  == 1, "yes", "no"), levels = c("no","yes"))
+svm_predictions <- predict(pca_svm_model,  pca_matrix_test, type = "prob")[, "yes"]
+predicted_classes <- factor(ifelse(svm_predictions > 0.5, "yes", "no"),
+                            levels = c("no","yes"))
+cm <- confusionMatrix(predicted_classes, y_test_factor)
+pca_bagofwords_svm_performance <- list(
+  accuracy = mean(predicted_classes==y_test_factor),
+  precision = cm$byClass["Pos Pred Value"],
+  recall = cm$byClass["Sensitivity"])
+pca_bagofwords_svm_performance$f1 <- 2 * (pca_bagofwords_svm_performance$precision * pca_bagofwords_svm_performance$recall) / (pca_bagofwords_svm_performance$precision + pca_bagofwords_svm_performance$recall)
+
+roc_obj <- roc(y_test, as.numeric(svm_predictions))
+pca_bagofwords_svm_performance$auc <- auc(roc_obj)
+pca_bagofwords_svm_performance$roc <- roc_obj
+
+#pca_bagofwords_svm_performance
+```
+
+### Neural network
+
+```{r}
+# formula <- as.formula(paste("y_train ~", paste(colnames(pca_matrix_train), collapse = " + ")))
+# y_train_factor <- factor(ifelse(y_train == 1, "yes", "no"),
+#                       levels = c("no","yes"))
+# set.seed(123)
+# nn_ctrl <- trainControl(
+#   method          = "cv",
+#   number          = 10,
+#   classProbs      = TRUE,
+#   summaryFunction = twoClassSummary,  
+#   savePredictions = "final"
+# )
+# 
+# 
+# nn_model <- train(
+#   formula,               
+#   data       = transform(nn_data, y_train = y_train_factor),  
+#   method     = "nnet",
+#   metric     = "ROC",    
+#   trControl  = nn_ctrl,
+#   tuneGrid  = expand.grid(size = 18, decay = 0.1),
+#   act.fct    = "tanh",
+#   linear.output = FALSE,
+#   threshold  = 0.01,
+#   lifesign   = "minimal"
+# )
+# save(nn_model, file = "models/neural_network_bag_of_words.RData")
+# # The training is slow. Store the model.
+```
+
+```{r}
+load(file = "models/neural_network_bag_of_words.RData")
+```
+
+```{r}
+
+nn_probs <- predict(nn_model, newdata = as.data.frame(pca_matrix_test), type = "prob")[, "yes"]
+
+predicted_classes <- ifelse(nn_probs > 0.5, "yes", "no")
+
+cm <- confusionMatrix(
+  factor(predicted_classes, levels = c("no","yes")),
+  y_test_factor,
+  positive = "yes"
+)
+
+
+pca_bagofwords_nn_performance <- list(
+  accuracy  = cm$overall["Accuracy"],
+  precision = cm$byClass["Pos Pred Value"],
+  recall    = cm$byClass["Sensitivity"],
+  f1        = cm$byClass["F1"]
+)
+
+
+roc_obj <- roc(response  = y_test_factor,
+               predictor = nn_probs,
+               levels    = c("no","yes"),
+               direction = "<")  
+pca_bagofwords_nn_performance$auc <- auc(roc_obj)
+pca_bagofwords_nn_performance$roc <- roc_obj
+
+#pca_bagofwords_nn_performance
+```
+
+## 3.2. TF-IDF
+
+### Data preparation
+
+```{r}
+# pca_result <- prcomp(dtm_tfidf_matrix)
+# save(pca_result, file="data/pca_tfidf.RData")
+```
+
+```{r}
+load(file="data/pca_tfidf.RData")
+variances <- pca_result$sdev^2 / sum(pca_result$sdev^2)
+cumulative_variances <- cumsum(variances)
+plot(variances[1:500], type = "b", xlab = "Principal Component", ylab = "Proportion of Variance Explained", main = "Scree Plot")
+```
+
+```{r}
+top_n = 50
+pca_tfidf_matrix <- pca_result$x[, 1:top_n]
+
+
+# prepare data
+y <- disaster_dataset$target
+
+set.seed(123)
+
+train_idx <- createDataPartition(y, p = 0.8, list = FALSE)
+pca_tfidf_matrix_train <- pca_tfidf_matrix[train_idx, ]
+pca_tfidf_matrix_test  <- pca_tfidf_matrix[-train_idx, ]
+y_train <- y[train_idx]
+y_test  <- y[-train_idx]
+```
+
+
+### Feature interpretation
+
+```{r}
+loadings_pc1 <- pca_result$rotation[, 1]
+loadings_pc1 <- loadings_pc1[order(abs(unlist(loadings_pc1)), decreasing=TRUE)]
+loadings_pc1_df <- data.frame(word = names(loadings_pc1), loading = loadings_pc1)
+
+loadings_pc2 <- pca_result$rotation[, 2]
+loadings_pc2 <- loadings_pc2[order(abs(unlist(loadings_pc2)), decreasing=TRUE)]
+loadings_pc2_df <- data.frame(word = names(loadings_pc2), loading = loadings_pc2)
+
+loadings_pc3 <- pca_result$rotation[, 3]
+loadings_pc3 <- loadings_pc3[order(abs(unlist(loadings_pc3)), decreasing=TRUE)]
+loadings_pc3_df <- data.frame(word = names(loadings_pc3), loading = loadings_pc3)
+
+par(mfrow = c(1, 3), mar = c(2, 5, 2, 2))
+barplot(loadings_pc1_df$loading[20:1],
+        names.arg = loadings_pc1_df$word[20:1],
+        horiz = TRUE,
+        las = 1,
+        cex.names = 0.8,
+        cex.main = 0.9,
+        col = "indianred2",
+        main = "Loadings for PC1",
+        xlab = "Loadings")
+barplot(loadings_pc2_df$loading[20:1],
+        names.arg = loadings_pc2_df$word[20:1],
+        horiz = TRUE,
+        las = 1,
+        cex.names = 0.8,
+        cex.main = 0.9,
+        col = "burlywood2",
+        main = "Loadings for PC2",
+        xlab = "Loadings")
+barplot(loadings_pc3_df$loading[20:1],
+        names.arg = loadings_pc3_df$word[20:1],
+        horiz = TRUE,
+        las = 1,
+        cex.names = 0.8,
+        cex.main = 0.9,
+        col = "cadetblue2",
+        main = "Loadings for PC3",
+        xlab = "Loadings")
+```
+
+### Logistic regression
+
+```{r}
+# Logistic Regression
+pca_tfidf_logit_model <- cv.glmnet(x = pca_tfidf_matrix_train, y = y_train, family = "binomial", alpha = 1, nfolds = 10)
+```
+
+
+```{r}
+predictions <- predict(pca_tfidf_logit_model, newx = pca_tfidf_matrix_test, s = "lambda.min", type = "response")
+predicted_classes <- ifelse(predictions > 0.5, 1, 0)
+cm <- confusionMatrix(factor(predicted_classes), factor(y_test))
+pca_tfidf_logit_performance <- list(
+  accuracy = mean(predicted_classes==y_test),
+  precision = cm$byClass["Pos Pred Value"],
+  recall = cm$byClass["Sensitivity"])
+pca_tfidf_logit_performance$f1 <- 2 * (pca_tfidf_logit_performance$precision * pca_tfidf_logit_performance$recall) / (pca_tfidf_logit_performance$precision + pca_tfidf_logit_performance$recall)
+
+roc_obj <- roc(y_test, as.numeric(predictions))
+pca_tfidf_logit_performance$auc <- auc(roc_obj)
+pca_tfidf_logit_performance$roc <- roc_obj
+
+# pca_tfidf_logit_performance
+```
+
+
+### SVM
+
+```{r}
+# set.seed(123)
+# svm_grid <- expand.grid(C = 1)
+# pca_tfidf_svm_model <- train(
+#   x       = pca_matrix_train,
+#   y       = factor(ifelse(y_train==1, "yes", "no"), levels = c("no","yes")),
+#   method  = "svmLinear",
+#   metric  = "ROC",
+#   trControl = svm_ctrl,
+#   tuneGrid = svm_grid,
+#   preProcess = c("zv","center","scale")
+# )
+# saveRDS(pca_tfidf_svm_model, file = "models/svm_model_pca_tfidf.rds")
+```
+
+```{r}
+pca_tfidf_svm_model <- readRDS("models/svm_model_pca_tfidf.rds")
+```
+
+```{r}
+y_test_factor = factor(ifelse(y_test  == 1, "yes", "no"), levels = c("no","yes"))
+svm_predictions <- predict(pca_tfidf_svm_model,  pca_matrix_test, type = "prob")[, "yes"]
+predicted_classes <- factor(ifelse(svm_predictions > 0.5, "yes", "no"),
+                            levels = c("no","yes"))
+cm <- confusionMatrix(predicted_classes, y_test_factor)
+pca_tfidf_svm_performance <- list(
+  accuracy = mean(predicted_classes==y_test_factor),
+  precision = cm$byClass["Pos Pred Value"],
+  recall = cm$byClass["Sensitivity"])
+pca_tfidf_svm_performance$f1 <- 2 * (pca_tfidf_svm_performance$precision * pca_tfidf_svm_performance$recall) / (pca_tfidf_svm_performance$precision + pca_tfidf_svm_performance$recall)
+
+roc_obj <- roc(y_test, as.numeric(svm_predictions))
+pca_tfidf_svm_performance$auc <- auc(roc_obj)
+pca_tfidf_svm_performance$roc <- roc_obj
+
+#pca_tfidf_svm_performance
+```
+
+### Neural network
+
+```{r}
+# nn_data <- as.data.frame(cbind(pca_tfidf_matrix_train, y_train))
+# formula <- as.formula(paste("y_train ~", paste(colnames(pca_tfidf_matrix_train), collapse = " + ")))
+# set.seed(123)
+# y_train_factor <- factor(ifelse(y_train == 1, "yes", "no"),
+#                       levels = c("no","yes"))
+# nn_ctrl <- trainControl(
+#   method          = "cv",
+#   number          = 10,
+#   classProbs      = TRUE,
+#   summaryFunction = twoClassSummary,  
+#   savePredictions = "final"
+# )
+# 
+# 
+# nn_model_tfidf <- train(
+#   formula,               
+#   data       = transform(nn_data, y_train = y_train_factor),  
+#   method     = "nnet",
+#   metric     = "ROC",    
+#   trControl  = nn_ctrl,
+#   tuneGrid  = expand.grid(size = 18, decay = 0.1),
+#   act.fct    = "tanh",
+#   linear.output = FALSE,
+#   threshold  = 0.01,
+#   lifesign   = "minimal"
+# )
+# save(nn_model_tfidf, file = "models/neural_network_tfidf.RData")
+# # The training is slow. Store the model.
+```
+
+
+```{r}
+load(file = "models/neural_network_tfidf.RData")
+
+```
+
+```{r}
+nn_probs <- predict(nn_model_tfidf, newdata = as.data.frame(pca_tfidf_matrix_test), type = "prob")[, "yes"]
+
+predicted_classes <- ifelse(nn_probs > 0.5, "yes", "no")
+
+cm <- confusionMatrix(
+  factor(predicted_classes, levels = c("no","yes")),
+  y_test_factor,
+  positive = "yes"
+)
+pca_tfidf_nn_performance <- list(
+  accuracy = cm$overall["Accuracy"],
+  precision = cm$byClass["Pos Pred Value"],
+  recall = cm$byClass["Sensitivity"])
+pca_tfidf_nn_performance$f1 <- 2 * (pca_tfidf_nn_performance$precision * pca_tfidf_nn_performance$recall) / (pca_tfidf_nn_performance$precision + pca_tfidf_nn_performance$recall)
+
+roc_obj <- roc(response  = y_test_factor,
+               predictor = nn_probs,
+               levels    = c("no","yes"),
+               direction = "<")  
+pca_tfidf_nn_performance$auc <- auc(roc_obj)
+pca_tfidf_nn_performance$roc <- roc_obj
+
+#pca_tfidf_nn_performance
+```
+
+
+## 3.3–3.4 Dense Embedding Strategies
+
+Unlike the sparse, frequency‑based Bag‑of‑Words and TF‑IDF representations, in this section we explore two **dense**, **semantically informed** feature spaces:
+
+1. **Word‑Level Embedding (GloVe)**  
+   - Build a term‑co‑occurrence matrix over a ±5‑word window and train 200‑dimensional GloVe vectors.  
+   - Represent each tweet as the average of its token embeddings, producing a compact, continuous feature vector that captures global word co‑occurrence patterns rather than raw counts.  
+
+2. **Sentence‑Level Embedding (BERT)**  
+   - Leverage a pre‑trained BERT model to extract 384‑dimensional contextual embeddings for each tweet (using the `[CLS]` token).  
+   - These embeddings encode rich, context‑sensitive semantics—detecting nuance, polysemy, and long‑range dependencies that neither BoW nor TF‑IDF can capture.  
+
+After generating these embeddings, we again split into train/test sets and compare three classifiers (logistic regression, SVM with **radial kernel**, and a single‑hidden‑layer neural network) to evaluate whether dense embeddings outperform sparse counts in detecting disaster‑related content. The **radial kernel SVM** is chosen here to model potential **nonlinear** separability in the low‑dimensional, dense embedding spaces.  
+
+## 3.3. Word-Level Embedding with GloVe
+
+### Data preparation
+
+In this step we convert each tweet into a dense, semantically informed vector by first tokenizing the cleaned text and building a term‑co‑occurrence matrix (TCM) over a ±5‑word window. We then train a 200‑dimensional GloVe model for 50 iterations, learning distributed word vectors from the TCM. Finally, we represent each tweet by averaging the GloVe vectors of its tokens, yielding a dense N\times200 matrix (dtm_glove) that can be fed directly into downstream classifiers.
+
+```{r message=FALSE}
+set.seed(123)
+# create iterator
+tokens <- space_tokenizer(disaster_dataset$text_cleaned)
+it <- itoken(tokens, progressbar = FALSE)
+vocab <- create_vocabulary(it)
+
+# create word frequency matrix
+vectorizer <- vocab_vectorizer(vocab)
+tcm <- create_tcm(it, vectorizer, skip_grams_window = 5L)
+
+# train GloVe model
+glove_rank = 200
+glove <- GlobalVectors$new(rank = glove_rank, x_max = 10)  # rank is the embedded dimension
+word_vectors <- glove$fit_transform(tcm, n_iter = 50, learning_rate = 0.05)
+word_vectors <- glove$components
+```
+
+```{r}
+dtm_glove <- matrix(, nrow = nrow(dtm), ncol = glove_rank)
+for (i in 1:nrow(disaster_dataset)) {
+  text <- disaster_dataset$text_cleaned[i]
+  tokens <- unlist(strsplit(text, "\\s+"))
+  vectors <- word_vectors[, tokens, drop = FALSE]
+  text_vec <- rowMeans(vectors)
+  dtm_glove[i,] <- text_vec
+}
+```
+
+```{r}
+y <- disaster_dataset$target 
+
+set.seed(123)  
+
+train_idx <- createDataPartition(y, p = 0.8, list = FALSE)
+dtm_glove_train <- dtm_glove[train_idx, ]
+dtm_glove_test  <- dtm_glove[-train_idx, ]
+y_train <- y[train_idx]
+y_test  <- y[-train_idx]
+```
+
+### Feature interpretation
+
+```{r}
+word_weights_1 <- word_vectors[1, ]
+word_weights_1 <- word_weights_1[order(abs(unlist(word_weights_1)), decreasing=TRUE)]
+word_weights_1_df <- data.frame(word = names(word_weights_1), weight = word_weights_1)
+
+word_weights_2 <- word_vectors[2, ]
+word_weights_2 <- word_weights_2[order(abs(unlist(word_weights_2)), decreasing=TRUE)]
+word_weights_2_df <- data.frame(word = names(word_weights_2), weight = word_weights_2)
+
+word_weights_3 <- word_vectors[3, ]
+word_weights_3 <- word_weights_3[order(abs(unlist(word_weights_3)), decreasing=TRUE)]
+word_weights_3_df <- data.frame(word = names(word_weights_3), weight = word_weights_3)
+
+par(mfrow = c(1, 3), mar = c(2, 5, 2, 2))
+barplot(word_weights_1_df$weight[20:1],
+        names.arg = word_weights_1_df$word[20:1],
+        horiz = TRUE,
+        las = 1,
+        cex.names = 0.8,
+        cex.main = 0.9,
+        col = "indianred2",
+        main = "Weights for embedded dimension 1",
+        xlab = "Weights")
+barplot(word_weights_2_df$weight[20:1],
+        names.arg = word_weights_2_df$word[20:1],
+        horiz = TRUE,
+        las = 1,
+        cex.names = 0.8,
+        cex.main = 0.9,
+        col = "burlywood2",
+        main = "Weights for embedded dimension 2",
+        xlab = "Weights")
+barplot(word_weights_3_df$weight[20:1],
+        names.arg = word_weights_3_df$word[20:1],
+        horiz = TRUE,
+        las = 1,
+        cex.names = 0.8,
+        cex.main = 0.9,
+        col = "cadetblue2",
+        main = "Weights for embedded dimension 3",
+        xlab = "Weights")
+```
+
+### Logistic regression
+
+```{r}
+# Logistic Regression
+cv_model <- cv.glmnet(x = dtm_glove_train, y = y_train, family = "binomial", alpha = 1, nfolds = 10)
+```
+
+
+```{r}
+predictions <- predict(cv_model, newx = dtm_glove_test, s = "lambda.min", type = "response")
+predicted_classes <- ifelse(predictions > 0.5, 1, 0)
+cm <- confusionMatrix(factor(predicted_classes), factor(y_test))
+glove_logit_performance <- list(
+  accuracy = mean(predicted_classes==y_test),
+  precision = cm$byClass["Pos Pred Value"],
+  recall = cm$byClass["Sensitivity"])
+glove_logit_performance$f1 <- 2 * (glove_logit_performance$precision * glove_logit_performance$recall) / (glove_logit_performance$precision + glove_logit_performance$recall)
+
+roc_obj <- roc(y_test, as.numeric(predictions))
+glove_logit_performance$auc <- auc(roc_obj)
+glove_logit_performance$roc <- roc_obj
+
+#glove_logit_performance
+```
+
+### SVM
+
+```{r}
+# set.seed(123)
+# embedding_svm_model <- svm(
+#   x           = dtm_glove_train,
+#   y           = y_train,
+#   kernel      = "radial",
+#   probability = TRUE,
+#   scale       = FALSE,
+#   cross       = 10    
+# )
+# saveRDS(embedding_svm_model, file = "models/svm_model_embedding.rds")
+```
+
+```{r}
+embedding_svm_model <- readRDS("models/svm_model_embedding.rds")
+```
+
+```{r}
+svm_predictionsGloVe <- predict(embedding_svm_model, dtm_glove_test, probability = TRUE)
+predicted_classes <- ifelse(svm_predictionsGloVe > 0.5, 1, 0)
+cm <- confusionMatrix(factor(predicted_classes), factor(y_test))
+glove_svm_performance <- list(
+  accuracy = mean(predicted_classes==y_test),
+  precision = cm$byClass["Pos Pred Value"],
+  recall = cm$byClass["Sensitivity"])
+glove_svm_performance$f1 <- 2 * (glove_svm_performance$precision * glove_svm_performance$recall) / (glove_svm_performance$precision + glove_svm_performance$recall)
+
+roc_obj <- roc(y_test, as.numeric(svm_predictionsGloVe))
+glove_svm_performance$auc <- auc(roc_obj)
+glove_svm_performance$roc <- roc_obj
+
+#glove_svm_performance
+```
+
+### Neural network
+
+```{r}
+# nn_data <- as.data.frame(cbind(dtm_glove_train, y_train))
+# formula <- as.formula(paste("y_train ~", paste(colnames(nn_data)[1:(ncol(nn_data)-1)], collapse = " + ")))
+# set.seed(123)
+# y_train_factor <- factor(ifelse(y_train == 1, "yes", "no"),
+#                       levels = c("no","yes"))
+# nn_ctrl <- trainControl(
+#   method          = "cv",
+#   number          = 10,
+#   classProbs      = TRUE,
+#   summaryFunction = twoClassSummary,  
+#   savePredictions = "final"
+# )
+# 
+# 
+# nn_model_embedding <- train(
+#   formula,               
+#   data       = transform(nn_data, y_train = y_train_factor),  
+#   method     = "nnet",
+#   metric     = "ROC",    
+#   trControl  = nn_ctrl,
+#   tuneGrid  = expand.grid(size = 8, decay=c(0.2,0.5)),
+#   act.fct    = "tanh",
+#   linear.output = FALSE,
+#   threshold  = 0.01,
+#   MaxNWts  = 5000,
+#   lifesign   = "minimal"
+# )
+# save(nn_model_embedding, file = "models/neural_network_glove.RData")
+# # The training is slow. Store the model.
+```
+
+```{r}
+load(file = "models/neural_network_glove.RData")
+```
+
+```{r}
+nn_probs <- predict(nn_model_embedding, newdata = as.data.frame(dtm_glove_test), type = "prob")[, "yes"]
+predicted_classes <- ifelse(nn_probs > 0.5, "yes", "no")
+
+cm <- confusionMatrix(
+  factor(predicted_classes, levels = c("no","yes")),
+  y_test_factor,
+  positive = "yes"
+)
+glove_nn_performance <- list(
+  accuracy = cm$overall["Accuracy"],
+  precision = cm$byClass["Pos Pred Value"],
+  recall = cm$byClass["Sensitivity"])
+glove_nn_performance$f1 <- 2 * (glove_nn_performance$precision * glove_nn_performance$recall) / (glove_nn_performance$precision + glove_nn_performance$recall)
+
+roc_obj <- roc(response  = y_test_factor,
+               predictor = nn_probs,
+               levels    = c("no","yes"),
+               direction = "<")  
+glove_nn_performance$auc <- auc(roc_obj)
+glove_nn_performance$roc <- roc_obj
+
+
+#glove_nn_performance
+```
+
+## 3.4. Sentence-Level Embedding with BERT
+
+### Data preparation
+```{r}
+#library(reticulate)
+
+# import python package
+#sentence_transformers <- import("sentence_transformers")
+#np <- import("numpy")
+
+#model <- sentence_transformers$SentenceTransformer("all-MiniLM-L6-v2")
+
+#texts <- disaster_dataset$text_cleaned_bert
+
+#embeddings <- model$encode(texts, show_progress_bar = TRUE)
+
+#np$save("data/dtm_bert.npy", embeddings)
+```
+
+```{r}
+# import python package
+#sentence_transformers <- import("sentence_transformers")
+np <- import("numpy")
+dtm_bert <- np$load("data/dtm_bert.npy") 
+dtm_bert <- as.array(dtm_bert)  
+
+y <- disaster_dataset$target
+
+library(caret)
+set.seed(123)
+train_idx <- createDataPartition(y, p = 0.8, list = FALSE)
+
+dtm_bert_train <- dtm_bert[train_idx, ]
+dtm_bert_test  <- dtm_bert[-train_idx, ]
+y_train <- y[train_idx]
+y_test  <- y[-train_idx]
+```
+
+### Logistic regression
+
+```{r}
+# Logistic Regression
+bert_logit_model <- cv.glmnet(x = dtm_bert_train, y = y_train, family = "binomial", alpha = 1, nfolds = 10)
+```
+
+
+```{r}
+predictions <- predict(bert_logit_model, newx = dtm_bert_test, s = "lambda.min", type = "response")
+predicted_classes <- ifelse(predictions > 0.5, 1, 0)
+cm <- confusionMatrix(factor(predicted_classes), factor(y_test))
+bert_logit_performance <- list(
+  accuracy = mean(predicted_classes==y_test),
+  precision = cm$byClass["Pos Pred Value"],
+  recall = cm$byClass["Sensitivity"])
+bert_logit_performance$f1 <- 2 * (bert_logit_performance$precision * bert_logit_performance$recall) / (bert_logit_performance$precision + bert_logit_performance$recall)
+
+roc_obj <- roc(y_test, as.numeric(predictions))
+bert_logit_performance$auc <- auc(roc_obj)
+bert_logit_performance$roc <- roc_obj
+
+#bert_logit_performance
+```
+
+### SVM
+
+```{r}
+# bert_svm_model <- svm(
+#   x           = dtm_bert_train,
+#   y           = y_train,
+#   kernel      = "radial",
+#   cost        = 2,                          
+#   gamma       = 1 / ncol(dtm_bert_train),   
+#   probability = TRUE,
+#   scale       = FALSE,
+#   cross       = 10
+# )
+# saveRDS(bert_svm_model, file = "models/svm_model_bert.rds")
+```
+
+```{r}
+
+bert_svm_model <- readRDS("models/svm_model_bert.rds")
+```
+
+```{r}
+svm_predictions <- predict(bert_svm_model, dtm_bert_test, probability = TRUE)
+predicted_classes <- ifelse(svm_predictions > 0.5, 1, 0)
+cm <- confusionMatrix(factor(predicted_classes), factor(y_test))
+bert_svm_performance <- list(
+  accuracy = mean(predicted_classes==y_test),
+  precision = cm$byClass["Pos Pred Value"],
+  recall = cm$byClass["Sensitivity"])
+bert_svm_performance$f1 <- 2 * (bert_svm_performance$precision * bert_svm_performance$recall) / (bert_svm_performance$precision + bert_svm_performance$recall)
+
+roc_obj <- roc(y_test, as.numeric(svm_predictions))
+bert_svm_performance$auc <- auc(roc_obj)
+bert_svm_performance$roc <- roc_obj
+
+#bert_svm_performance
+```
+
+
+### Neural network
+
+```{r}
+# nn_data <- as.data.frame(cbind(dtm_bert_train, y_train))
+# formula <- as.formula(paste("y_train ~", paste(colnames(nn_data)[1:(ncol(nn_data)-1)], collapse = " + ")))
+# set.seed(123)
+# y_train_factor <- factor(ifelse(y_train == 1, "yes", "no"),
+#                       levels = c("no","yes"))
+# nn_ctrl <- trainControl(
+#   method          = "cv",
+#   number          = 10,
+#   classProbs      = TRUE,
+#   summaryFunction = twoClassSummary,  
+#   savePredictions = "final"
+# )
+# 
+# 
+# nn_model_bert <- train(
+#   formula,               
+#   data       = transform(nn_data, y_train = y_train_factor),  
+#   method     = "nnet",
+#   metric     = "ROC",    
+#   trControl  = nn_ctrl,
+#   tuneGrid  = expand.grid(size = 8, decay=c(0.2,0.5)),
+#   act.fct    = "tanh",
+#   linear.output = FALSE,
+#   threshold  = 0.01,
+#   MaxNWts  = 5000,
+#   lifesign   = "minimal"
+# )
+# save(nn_model_bert, file = "models/neural_network_bert.RData")
+# # The training is slow. Store the model.
+```
+
+```{r}
+load(file = "models/neural_network_bert.RData")
+```
+
+```{r}
+nn_probs <- predict(nn_model_bert, newdata = as.data.frame(dtm_bert_test), type = "prob")[, "yes"]
+
+predicted_classes <- ifelse(nn_probs > 0.5, "yes", "no")
+
+cm <- confusionMatrix(
+  factor(predicted_classes, levels = c("no","yes")),
+  y_test_factor,
+  positive = "yes"
+)
+
+bert_nn_performance <- list(
+  accuracy = cm$overall["Accuracy"],
+  precision = cm$byClass["Pos Pred Value"],
+  recall = cm$byClass["Sensitivity"])
+bert_nn_performance$f1 <- 2 * (bert_nn_performance$precision * bert_nn_performance$recall) / (bert_nn_performance$precision + bert_nn_performance$recall)
+
+roc_obj <- roc(response  = y_test_factor,
+               predictor = nn_probs,
+               levels    = c("no","yes"),
+               direction = "<")  
+bert_nn_performance$auc <- auc(roc_obj)
+bert_nn_performance$roc <- roc_obj
+
+#bert_nn_performance
+```
+
+
+## 3.5. Model Performance Summary
+
+```{r}
+performance_table <- data.frame(
+  Method    = c("Bag of Words", "Bag of Words", "Bag of Words", 
+                "TFIDF", "TFIDF", "TFIDF", 
+                "Word-Embedding (GloVe)", "Word-Embedding (GloVe)", "Word-Embedding (GloVe)",
+                "Sentence-Embedding (BERT)", "Sentence-Embedding (BERT)", "Sentence-Embedding (BERT)"),
+  Model     = c("Logistic", "SVM", "Neural network",
+                "Logistic", "SVM", "Neural network",
+                "Logistic", "SVM", "Neural network",
+                "Logistic", "SVM", "Neural network"),
+  Accuracy  = c(pca_bagofwords_logit_performance$accuracy, 
+                pca_bagofwords_svm_performance$accuracy,
+                pca_bagofwords_nn_performance$accuracy,
+                
+                pca_tfidf_logit_performance$accuracy, 
+                pca_tfidf_svm_performance$accuracy,
+                pca_tfidf_nn_performance$accuracy,
+                
+                glove_logit_performance$accuracy, 
+                glove_svm_performance$accuracy,
+                glove_nn_performance$accuracy,
+                
+                bert_logit_performance$accuracy,
+                bert_svm_performance$accuracy,
+                bert_nn_performance$accuracy),
+  Precision = c(pca_bagofwords_logit_performance$precision, 
+                pca_bagofwords_svm_performance$precision,
+                pca_bagofwords_nn_performance$precision,
+                
+                pca_tfidf_logit_performance$precision, 
+                pca_tfidf_svm_performance$precision,
+                pca_tfidf_nn_performance$precision,
+                
+                glove_logit_performance$precision, 
+                glove_svm_performance$precision,
+                glove_nn_performance$precision,
+                
+                bert_logit_performance$precision,
+                bert_svm_performance$precision,
+                bert_nn_performance$precision),
+  Recall    = c(pca_bagofwords_logit_performance$recall, 
+                pca_bagofwords_svm_performance$recall,
+                pca_bagofwords_nn_performance$recall,
+                
+                pca_tfidf_logit_performance$recall, 
+                pca_tfidf_svm_performance$recall,
+                pca_tfidf_nn_performance$recall,
+                
+                glove_logit_performance$recall, 
+                glove_svm_performance$recall,
+                glove_nn_performance$recall,
+                
+                bert_logit_performance$recall,
+                bert_svm_performance$recall,
+                bert_nn_performance$recall),
+  F1.score  = c(pca_bagofwords_logit_performance$f1, 
+                pca_bagofwords_svm_performance$f1,
+                pca_bagofwords_nn_performance$f1,
+                
+                pca_tfidf_logit_performance$f1, 
+                pca_tfidf_svm_performance$f1,
+                pca_tfidf_nn_performance$f1,
+                
+                glove_logit_performance$f1, 
+                glove_svm_performance$f1,
+                glove_nn_performance$f1,
+                
+                bert_logit_performance$f1,
+                bert_svm_performance$f1,
+                bert_nn_performance$f1),
+  AUC       = c(pca_bagofwords_logit_performance$auc, 
+                pca_bagofwords_svm_performance$auc,
+                pca_bagofwords_nn_performance$auc,
+                
+                pca_tfidf_logit_performance$auc, 
+                pca_tfidf_svm_performance$auc,
+                pca_tfidf_nn_performance$auc,
+                
+                glove_logit_performance$auc, 
+                glove_svm_performance$auc,
+                glove_nn_performance$auc,
+                
+                bert_logit_performance$auc,
+                bert_svm_performance$auc,
+                bert_nn_performance$auc)
+)
+
+kable(performance_table, format = "markdown")
+```
+
+```{r}
+plot(pca_bagofwords_logit_performance$roc, col=1, main="ROC plot - All Representations")
+
+# Bag of Words
+plot(pca_bagofwords_svm_performance$roc, col=2, add=TRUE)
+plot(pca_bagofwords_nn_performance$roc, col=3, add=TRUE)
+
+# TF-IDF
+plot(pca_tfidf_logit_performance$roc, col=4, add=TRUE)
+plot(pca_tfidf_svm_performance$roc, col=5, add=TRUE)
+plot(pca_tfidf_nn_performance$roc, col=6, add=TRUE)
+
+# GloVe
+plot(glove_logit_performance$roc, col=7, add=TRUE)
+plot(glove_svm_performance$roc, col=8, add=TRUE)
+plot(glove_nn_performance$roc, col=9, add=TRUE)
+
+# BERT
+plot(bert_logit_performance$roc, col=10, add=TRUE)
+plot(bert_svm_performance$roc, col=11, add=TRUE)
+plot(bert_nn_performance$roc, col=12, add=TRUE)
+
+
+legend("bottomright", col = 1:12, lty = 1,
+       legend = c("Bag of Words, Logistic", "Bag of Words, SVM", "Bag of Words, Neural Net",
+                  "TF-IDF, Logistic", "TF-IDF, SVM", "TF-IDF, Neural Net",
+                  "GloVe, Logistic", "GloVe, SVM", "GloVe, Neural Net",
+                  "BERT, Logistic", "BERT, SVM", "BERT, Neural Net"))
+```
+
+## 3.6. Model Performance Visualization
+
+### Text Representation Performance
+
+```{r}
+method_colors <- c(
+  "Bag of Words" = "#a6cee3",      
+  "TFIDF" = "#b2df8a",              
+  "Word-Embedding (GloVe)" = "#fb9a99",  
+  "Sentence-Embedding (BERT)" = "#fdbf6f" 
+)
+
+metrics <- c("Accuracy", "Precision", "Recall", "F1.score", "AUC")
+
+for (metric in metrics) {
+  performance_table %>%
+    mutate(Label = paste(Method, Model, sep = ", ")) %>%
+    arrange(desc(.data[[metric]])) %>%
+    ggplot(aes(x = reorder(Label, .data[[metric]]), y = .data[[metric]], fill = Method)) +
+    geom_col(color = "black", width = 0.7) +
+    coord_flip() +
+    scale_fill_manual(values = method_colors) +
+    guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+    labs(
+      title = paste(metric, ""),
+      x = NULL,
+      y = metric,
+      fill = "Method"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      legend.position = "bottom",
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      axis.text.y = element_text(size = 9.5)
+    ) -> p
+
+  print(p)
+}
+
+```
+
+### Prediction Model Performance
+
+```{r}
+model_colors <- c(
+  "Logistic" = "#66c2a5",        
+  "SVM" = "#fc8d62",            
+  "Neural network" = "#8da0cb"   
+)
+
+metrics <- c("Accuracy", "Precision", "Recall", "F1.score", "AUC")
+
+for (metric in metrics) {
+  performance_table %>%
+    mutate(Label = paste(Method, Model, sep = ", ")) %>%
+    arrange(desc(.data[[metric]])) %>%
+    ggplot(aes(x = reorder(Label, .data[[metric]]), y = .data[[metric]], fill = Model)) +
+    geom_col(color = "black", width = 0.7) +
+    coord_flip() +
+    scale_fill_manual(values = model_colors) +
+    #guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+    labs(
+      title = paste(metric, ""),
+      x = NULL,
+      y = metric,
+      fill = "Model"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      legend.position = "bottom",
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      axis.text.y = element_text(size = 11)
+    ) -> p
+
+  print(p)
+}
+```
+
+## 3.7. Model Selection & Recommendations
+
+Based on our comparative results, different operational goals call for different “best” models:
+
+1. **Maximum Discrimination (AUC)**
+  - **Metric:** AUC  
+  - **Winner:** BERT‑based Neural Network (AUC ≈ 0.87)  
+  - **Use when:** You need the strongest ranking power to prioritize the most certain disaster tweets.
+
+2. **Highest Predictive Accuracy**
+  - **Metric:** Accuracy  
+  - **Winner:** BERT‑based Neural Network (Accuracy ≈ 0.82)  
+  - **Use when:** Overall correctness on unseen data is your primary concern.
+
+3. **Balanced Precision & Recall (F1‑score)**
+  - **Metric:** F1‑score  
+  - **Winner:** BERT Logistic Regression (F1 ≈ 0.84)  
+  - **Use when:** You want a single thresholded classifier that equally penalizes false positives and false negatives.
+
+4. **Maximum Recall (Sensitivity)**
+  - **Metric:** Recall  
+  - **Winner:** GloVe + SVM (Recall ≈ 0.91)  
+  - **Use when:** Missing any real disaster tweet is unacceptable, even if it means more false alarms.
+
+5. **Lightweight & Fast Inference**
+  - **Metric:** Training/Serving Efficiency  
+  - **Winner:** TF‑IDF or BoW + Logistic Regression (AUC ≈ 0.83–0.85)  
+  - **Use when:** Compute resources or latency constraints demand a simple, scalable model.
+
+---
+
+**Summary Table**
+
+| Goal                               | Metric    | Best Model                     |
+|------------------------------------|-----------|--------------------------------|
+| Maximum discrimination             | AUC       | BERT NN                        |
+| Highest predictive accuracy        | Accuracy  | BERT NN                        |
+| Balanced precision & recall        | F1‑score  | BERT Logistic Regression       |
+| Maximum recall                     | Recall    | GloVe + SVM                    |
+| Lightweight, fast inference        | Efficiency| TF‑IDF/BoW + Logistic Regression|
+
+
+
+# 4. Clustering disaster types
+
+In this module we go beyond binary “emergency vs. non‑emergency” detection and apply two complementary **unsupervised** methods—hierarchical clustering (average linkage) and k‑means—to the subset of tweets flagged as emergencies, in order to discover two interpretable incident subtypes.
+
+1. **Dense Representation**  
+   We reuse the 200‑dimensional GloVe embeddings (`dtm_glove`) to represent every tweet as a fixed‑length vector.
+
+2. **Emergency Filtering**  
+   A sigmoid‑kernel SVM predicts the probability that each tweet refers to an emergency; we select all tweets with \(p>0.5\) as our “emergency subset.”
+
+3. **Hierarchical Clustering**  
+   On the emergency subset we compute a distance matrix (e.g. Euclidean) and run `hclust(..., method = "average")` to build a dendrogram.  We then cut the tree at \(k=2\) to obtain two clusters (`hc_cluster`), providing an interpretable hierarchy and linkage structure.
+
+4. **K‑Means Clustering**  
+   In parallel we apply **k‑means** with \(k=2\) to the same subset, yielding an alternative, centroid‑based partition (`km_cluster`).  This lets us compare flat versus hierarchical splits.
+
+5. **Visualization via PCA**  
+   We project all GloVe vectors into their first two principal components and plot side‑by‑side:
+   - **True labels** (non‑emergency vs. emergency)  
+   - **Hierarchical clusters** (0, 1, 2)  
+   - **K‑means clusters** (0, 1, 2)  
+   to assess how each method separates the data.
+
+6. **Cluster Interpretation**  
+   For each of the three groups—non‑emergency, cluster 1, and cluster 2 (from either method)—we extract the top 25 raw‑frequency words from the original Bag‑of‑Words matrix.  We find that one cluster aligns with natural disasters (e.g. “wildfire,” “burn”) and the other with human‑caused incidents (e.g. “bomb,” “suicid”), demonstrating that both clustering approaches yield semantically coherent subtypes.
+
+---
+
+**Key Points**  
+- We use **average‑linkage hierarchical clustering** to reveal nested similarity structure and **k‑means** for a fast, centroid‑based split.  
+- Both methods operate **only on** tweets already detected as emergencies, ensuring we focus our subtyping on truly relevant texts.  
+- The dual approach and PCA visualization allow us to validate cluster stability and interpretability before labeling incident types.  
+
+```{r message=FALSE}
+# ------------ GloVe embedding ------------ #
+set.seed(123)
+glove_rank = 200
+tokens <- space_tokenizer(disaster_dataset$text_cleaned)
+it <- itoken(tokens, progressbar = FALSE)
+vocab <- create_vocabulary(it)
+vectorizer <- vocab_vectorizer(vocab)
+tcm <- create_tcm(it, vectorizer, skip_grams_window = 5L)
+glove <- GlobalVectors$new(rank = glove_rank, x_max = 10)  # rank is the embedded dimension
+word_vectors <- glove$fit_transform(tcm, n_iter = 50, learning_rate = 0.05)
+word_vectors <- glove$components
+dtm_glove <- matrix(, nrow = nrow(dtm), ncol = glove_rank)
+for (i in 1:nrow(disaster_dataset)) {
+  text <- disaster_dataset$text_cleaned[i]
+  tokens <- unlist(strsplit(text, "\\s+"))
+  vectors <- word_vectors[, tokens, drop = FALSE]
+  text_vec <- rowMeans(vectors)
+  dtm_glove[i,] <- text_vec
+}
+```
+
+```{r}
+# ------------ SVM sigmoid ------------ #
+y <- disaster_dataset$target 
+set.seed(123)
+train_idx <- createDataPartition(y, p = 0.8, list = FALSE)
+dtm_glove_train <- dtm_glove[train_idx, ]
+dtm_glove_test  <- dtm_glove[-train_idx, ]
+y_train <- y[train_idx]
+y_test  <- y[-train_idx]
+svm_model <- svm(dtm_glove_train, y_train, kernel = "sigmoid",
+                 probability = TRUE, scale = FALSE)
+
+svm_predictions_all <- predict(svm_model, dtm_glove, probability = TRUE)
+predicted_classes_all <- ifelse(svm_predictions_all > 0.5, 1, 0)
+disaster_dataset$predicted <- predicted_classes_all
+```
+
+```{r}
+detected_disaster_idx <- which(grepl(1, predicted_classes_all))
+glove_matrix_disaster <- dtm_glove[detected_disaster_idx, ]
+
+set.seed(123)
+kmeans_result <- kmeans(glove_matrix_disaster, centers = 2)
+
+for (i in 1:length(detected_disaster_idx)) {
+  idx <- detected_disaster_idx[i]
+  disaster_dataset$predicted[idx] <- kmeans_result$cluster[i]
+}
+```
+
+```{r}
+pca_result <- prcomp(dtm_glove)
+disaster_dataset$X <- pca_result$x[, 1]
+disaster_dataset$Y <- pca_result$x[, 2]
+```
+
+Note that the PC1 and PC2 here are based on word embedding dimensions.
+
+```{r}
+g1 <- ggplot(disaster_dataset[order(disaster_dataset$predicted), ], 
+             aes(x = X, y = Y, color = factor(target))) +
+  geom_point() +
+  labs(title = "Ground truth", x = "PC1", y = "PC2") +
+  theme(legend.title = element_blank()) +
+  scale_color_discrete(labels = c("Non-emergency", "Emergency"))
+
+g2 <- ggplot(disaster_dataset[order(disaster_dataset$predicted), ], 
+             aes(x = X, y = Y, color = factor(predicted))) +
+  geom_point() +
+  theme(legend.title = element_blank()) +
+  labs(title = "Non-Emergency vs. Emergency Categories", x = "PC1", y = "PC2") +
+  scale_color_discrete(labels = c("Non-emergency", "Type 1", "Type 2"))
+
+ggarrange(g1, g2, legend="bottom")
+```
+
+```{r}
+disaster1_idx <- which(grepl(1, disaster_dataset$predicted))
+dtm_matrix_disaster1 <- dtm_matrix[disaster1_idx, ]
+word_freq_disaster1 <- sort(colSums(dtm_matrix_disaster1), decreasing = TRUE)
+word_df_disaster1 <- data.frame(word = names(word_freq_disaster1), freq = word_freq_disaster1)
+
+disaster2_idx <- which(grepl(2, disaster_dataset$predicted))
+dtm_matrix_disaster2 <- dtm_matrix[disaster2_idx, ]
+word_freq_disaster2 <- sort(colSums(dtm_matrix_disaster2), decreasing = TRUE)
+word_df_disaster2 <- data.frame(word = names(word_freq_disaster2), freq = word_freq_disaster2)
+
+nondisaster_idx <- which(grepl(0, disaster_dataset$predicted))
+dtm_matrix_nondisaster <- dtm_matrix[nondisaster_idx, ]
+word_freq_nondisaster <- sort(colSums(dtm_matrix_nondisaster), decreasing = TRUE)
+word_df_nondisaster <- data.frame(word = names(word_freq_nondisaster), freq = word_freq_nondisaster)
+
+
+par(mfrow = c(1, 3), mar = c(2, 5, 2, 2))
+barplot(word_df_nondisaster$freq[25:1],
+        names.arg = word_df_nondisaster$word[25:1],
+        horiz = TRUE,
+        las = 1,
+        cex.names = 0.8,
+        col = "skyblue3",
+        main = "Top 25 Words (Non-emergency)",
+        cex.main = 0.9,
+        xlab = "Frequency")
+barplot(word_df_disaster1$freq[25:1],
+        names.arg = word_df_disaster1$word[25:1],
+        horiz = TRUE,
+        las = 1,
+        cex.names = 0.8,
+        cex.main = 0.9,
+        col = "indianred2",
+        main = "Top 25 Words (Type 1)",
+        xlab = "Frequency")
+barplot(word_df_disaster2$freq[25:1],
+        names.arg = word_df_disaster2$word[25:1],
+        horiz = TRUE,
+        las = 1,
+        cex.names = 0.8,
+        cex.main = 0.9,
+        col = "orange2",
+        main = "Top 25 Words (Type 2)",
+        xlab = "Frequency")
+
+```
+
+```{r}
+dist_mat <- dist(glove_matrix_disaster, method = "euclidean")
+
+hc <- hclust(dist_mat, method = "average")
+
+cluster_labels <- cutree(hc, k = 2)
+
+disaster_dataset_clus <- disaster_dataset
+disaster_dataset_clus$predicted_type <- 0
+disaster_dataset_clus$predicted_type[detected_disaster_idx] <- cluster_labels
+
+pca_result <- prcomp(dtm_glove)
+disaster_dataset_clus$X <- pca_result$x[, 1]
+disaster_dataset_clus$Y <- pca_result$x[, 2]
+
+g1 <- ggplot(disaster_dataset_clus[order(disaster_dataset_clus$predicted), ], 
+             aes(x = X, y = Y, color = factor(target))) +
+  geom_point() +
+  labs(title = "Ground truth", x = "PC1", y = "PC2") +
+  theme(legend.title = element_blank()) +
+  scale_color_discrete(labels = c("Non-emergency", "Emergency"))
+
+g2 <- ggplot(disaster_dataset_clus[order(disaster_dataset_clus$predicted), ], 
+             aes(x = X, y = Y, color = factor(predicted))) +
+  geom_point() +
+  theme(legend.title = element_blank()) +
+  labs(title = "Non-emergency", x = "PC1", y = "PC2") +
+  scale_color_discrete(labels = c("Non-Emergency vs. Emergency Categories", "Type 1", "Type 2"))
+
+ggarrange(g1, g2, legend="bottom")
+
+```
+```{r}
+disaster1_idx <- which(grepl(1, disaster_dataset_clus$predicted))
+dtm_matrix_disaster1 <- dtm_matrix[disaster1_idx, ]
+word_freq_disaster1 <- sort(colSums(dtm_matrix_disaster1), decreasing = TRUE)
+word_df_disaster1 <- data.frame(word = names(word_freq_disaster1), freq = word_freq_disaster1)
+
+disaster2_idx <- which(grepl(2, disaster_dataset_clus$predicted))
+dtm_matrix_disaster2 <- dtm_matrix[disaster2_idx, ]
+word_freq_disaster2 <- sort(colSums(dtm_matrix_disaster2), decreasing = TRUE)
+word_df_disaster2 <- data.frame(word = names(word_freq_disaster2), freq = word_freq_disaster2)
+
+nondisaster_idx <- which(grepl(0, disaster_dataset_clus$predicted))
+dtm_matrix_nondisaster <- dtm_matrix[nondisaster_idx, ]
+word_freq_nondisaster <- sort(colSums(dtm_matrix_nondisaster), decreasing = TRUE)
+word_df_nondisaster <- data.frame(word = names(word_freq_nondisaster), freq = word_freq_nondisaster)
+
+
+par(mfrow = c(1, 3), mar = c(2, 5, 2, 2))
+barplot(word_df_nondisaster$freq[25:1],
+        names.arg = word_df_nondisaster$word[25:1],
+        horiz = TRUE,
+        las = 1,
+        cex.names = 0.8,
+        col = "skyblue3",
+        main = "Top 25 Words (Non-emergency)",
+        cex.main = 0.9,
+        xlab = "Frequency")
+barplot(word_df_disaster1$freq[25:1],
+        names.arg = word_df_disaster1$word[25:1],
+        horiz = TRUE,
+        las = 1,
+        cex.names = 0.8,
+        cex.main = 0.9,
+        col = "indianred2",
+        main = "Top 25 Words (Type 1)",
+        xlab = "Frequency")
+barplot(word_df_disaster2$freq[25:1],
+        names.arg = word_df_disaster2$word[25:1],
+        horiz = TRUE,
+        las = 1,
+        cex.names = 0.8,
+        cex.main = 0.9,
+        col = "orange2",
+        main = "Top 25 Words (Type 2)",
+        xlab = "Frequency")
+
+```
+
+
+# 5. Further Exploration: Most Misclassified Messages.
+
+We focus on the GloVe‑SVM model because its high recall (0.91) and relatively low precision (0.67) reveal a substantial number of false positives.  From the top 20 words in these false‑positive tweets, 15 are genuinely disaster‑related (e.g. “fire”, “flood”), while 5 (e.g. “fatal”, “error”) are contextually ambiguous.
+
+- **Noisy co‑occurrence**  
+  Non‑disaster terms frequently appear alongside true disaster vocabulary in the training data, causing the model to incorrectly learn them as disaster signals.
+
+- **Contextual ambiguity**  
+  Words like **fatal**—which connote severity or death—do not always indicate a disaster event (e.g. “a fatal error in the code”, “fatal attraction”).  The absence of sentence‑level context in averaged GloVe vectors leads to these misclassifications.
+
+
+```{r}
+svm_predicted_classesGloVe <- ifelse(svm_predictionsGloVe > 0.5, 1, 0)
+#text_test <- disaster_dataset$text[-train_idx]
+text_test <- disaster_dataset$text_cleaned[-train_idx]
+
+
+fp_df_svm <- data.frame(
+  text = text_test,
+  actual = y_test,
+  predicted = svm_predicted_classesGloVe,
+  stringsAsFactors = FALSE
+)
+
+
+false_positives_svm <- fp_df_svm %>%
+  filter(actual == 0 & predicted == 1)
+
+
+data("stop_words")
+fp_words_svm <- false_positives_svm %>%
+  unnest_tokens(word, text) %>%
+  anti_join(stop_words, by = "word") %>%
+  count(word, sort = TRUE)
+
+fp_words_svm %>%
+  top_n(20, n) %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(x = word, y = n)) +
+  geom_col(fill = "#66c2a5", color = "black") +
+  coord_flip() +
+  labs(title = "Top 20 Words in SVM False Positives",
+       x = NULL, y = "Frequency") +
+  theme_minimal(base_size = 14)
+
+set.seed(123)
+wordcloud(
+  words = fp_words_svm$word,
+  freq = fp_words_svm$n,
+  min.freq = 2,
+  max.words = 100,
+  random.order = FALSE,
+  colors = brewer.pal(8, "Dark2")
+)
+
+
+disaster_keywords <- c(
+  "fire", "collaps", "nuclear", "crash", "bomb", "sinkhol", "flood", "devast", 
+  "structur", "storm", "reactor", "militari", "failur", "derail", 
+  "catastroph", "burn", "armi"
+)
+
+
+fp_words_svm_flagged <- fp_words_svm %>%
+  mutate(
+    label = ifelse(word %in% disaster_keywords, "Disaster-related", "Not disaster-related")
+  )
+
+fp_words_svm_flagged %>%
+  top_n(20, n) %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(x = word, y = n, fill = label)) +
+  geom_col(color = "black") +
+  coord_flip() +
+  labs(title = "Top 20 Words False Positives in GloVe-SVM Model",
+       x = NULL, y = "Frequency", fill = "Type") +
+  scale_fill_manual(values = c("Disaster-related" = "#fc8d62", "Not disaster-related" = "#8da0cb")) +
+  theme_minimal(base_size = 12)
+```
+
+
