@@ -139,9 +139,9 @@ After downloading, your directory should look like:
 ```
 
 ## Authors
-  - Lulin Yang (email: luy30@pitt.edu)   
-  - Wendi Li (email: wel242@pitt.edu)  
-  - Xiaoxuan Qin (email: xiq33@pitt.edu)  
+  - Lulin Yang 
+  - Wendi Li   
+  - Xiaoxuan Qin 
 
 ## Acknowledgments
 - We gratefully acknowledge **Kaggle** for hosting the “Natural Language Processing with Disaster Tweets” competition and providing the labeled dataset that forms the basis of this study  [oai_citation_attribution:0‡Kaggle](https://www.kaggle.com/competitions/nlp-getting-started/overview/evaluation?utm_source=chatgpt.com).  
